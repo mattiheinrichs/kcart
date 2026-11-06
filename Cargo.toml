@@ -1,0 +1,33 @@
+[package]
+name = "kcart"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT"
+description = "XDP filter that drops Minecraft handshakes for hostnames the server does not serve"
+keywords = ["ebpf", "xdp", "minecraft", "firewall"]
+categories = ["network-programming", "command-line-utilities"]
+build = "build.rs"
+[lib]
+name = "kcart"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kcart"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+aya = "0.16"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+log = { version = "0.4", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "signal", "net", "macros"] }
+toml = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

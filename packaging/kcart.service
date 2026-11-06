@@ -1,0 +1,29 @@
+[Unit]
+Description=kcart XDP filter for Minecraft
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/kcart run --config /etc/kcart/kcart.toml
+ExecReload=kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+# Loading and attaching XDP needs CAP_BPF and CAP_NET_ADMIN, the verifier
+# runs with fewer restrictions when CAP_PERFMON is present as well.
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/sys/fs/bpf
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

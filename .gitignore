@@ -1,0 +1,7 @@
+/target
+/build
+*.o
+*.ll
+/.idea
+/.vscode
+.DS_Store

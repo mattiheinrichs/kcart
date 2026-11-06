@@ -1,0 +1,42 @@
+# kcart configuration. Every key is optional on the command line side:
+# flags passed to "kcart run" override the values in this file.
+# "kcart check-config --config kcart.toml" validates it and prints the result.
+
+# Interface the filter attaches to. Required.
+interface = "eth0"
+
+# TCP ports to protect. Traffic to other ports is never touched.
+ports = [25565]
+
+# Server addresses that are allowed to connect. Case does not matter.
+# "*.example.com" matches subdomains of example.com but not example.com itself.
+# A connection whose handshake names any other host is dropped.
+# Allowed are ASCII letters, digits, '-', '.', '_' and ':', so write
+# internationalized names in their punycode (xn--) form.
+hosts = [
+    "play.example.com",
+    "*.play.example.com",
+]
+
+# XDP attach mode. "auto" tries the driver (native) mode first and falls
+# back to generic "skb" mode with a warning, "native" and "skb" force one.
+mode = "auto"
+
+# Number of connections remembered after a valid handshake. Oldest entries
+# are evicted when the table is full. Can only be changed with a restart.
+flows_max = 262144
+
+# Upper bound on drop events reported per second and CPU. 0 disables events.
+events_per_sec = 100
+
+# Pre-1.7 clients send a server list ping (0xFE) without a hostname.
+# They are dropped unless this is true.
+allow_legacy_ping = false
+
+# Answer a dropped handshake with a TCP RST through the local stack, so the
+# server closes the already accepted connection right away instead of
+# waiting for its handshake timeout.
+rst = false
+
+# "text" or "json", one line per drop event on stdout.
+log_format = "text"

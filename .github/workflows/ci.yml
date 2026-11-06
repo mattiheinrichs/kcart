@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bpf:
+    name: XDP program
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang and bpftool
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq clang llvm libbpf-dev linux-tools-common linux-tools-$(uname -r)
+      - name: Build
+        run: make bpf
+      - name: Verify and run packet tests
+        run: |
+          sudo mount -t bpf bpf /sys/fs/bpf || true
+          sudo make test-bpf
+
+  rust:
+    name: Loader
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq clang llvm libbpf-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --release
+      - run: cargo test
