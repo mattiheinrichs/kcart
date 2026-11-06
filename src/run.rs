@@ -29,7 +29,7 @@ pub struct RunArgs {
     /// Interface to attach to
     #[arg(long, value_name = "IFACE")]
     iface: Option<String>,
-    /// Protected TCP port, repeatable; replaces the ports from the config file
+    /// Protected TCP port, repeatable; replaces the ports from the config file (default 25565)
     #[arg(long = "port", value_name = "P")]
     ports: Vec<u16>,
     /// Allowed host, repeatable; replaces the hosts from the config file

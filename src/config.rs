@@ -14,6 +14,7 @@ pub const HOSTS_MAX: usize = 1024;
 /// `FLOWS_DEFAULT_MAX` in the BPF program.
 pub const FLOWS_DEFAULT_MAX: u32 = 262_144;
 pub const EVENTS_PER_SEC_DEFAULT: u32 = 100;
+pub const DEFAULT_PORT: u16 = 25565;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -97,14 +98,14 @@ impl PartialConfig {
             None => bail!("no interface given (set interface in the config file or pass --iface)"),
         };
 
-        let mut ports = self.ports.unwrap_or_default();
+        let mut ports = self.ports.unwrap_or_else(|| vec![DEFAULT_PORT]);
         if ports.contains(&0) {
             bail!("port 0 is not a valid TCP port");
         }
         ports.sort_unstable();
         ports.dedup();
         if ports.is_empty() {
-            bail!("no ports given (set ports in the config file or pass --port)");
+            bail!("ports is empty, nothing to protect");
         }
 
         let mut hosts = self
@@ -217,10 +218,11 @@ log_format = "json"
 
     #[test]
     fn defaults() {
-        let config = PartialConfig::parse("interface = \"eth0\"\nports = [25565]\n")
+        let config = PartialConfig::parse("interface = \"eth0\"\n")
             .unwrap()
             .resolve()
             .unwrap();
+        assert_eq!(config.ports, vec![DEFAULT_PORT]);
         assert_eq!(config.mode, Mode::Auto);
         assert_eq!(config.flows_max, FLOWS_DEFAULT_MAX);
         assert_eq!(config.events_per_sec, EVENTS_PER_SEC_DEFAULT);
@@ -255,7 +257,7 @@ log_format = "json"
             .unwrap()
             .resolve()
             .is_err());
-        assert!(PartialConfig::parse("interface = \"eth0\"")
+        assert!(PartialConfig::parse("interface = \"eth0\"\nports = []")
             .unwrap()
             .resolve()
             .is_err());
