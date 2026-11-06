@@ -97,6 +97,9 @@ like modified packets; turn the reset off.
 
 Tested on Debian 12, kernel 6.1, virtio_net.
 
+Written together with AI. Everything here was measured and tested before it
+went in.
+
 ## License
 
 Loader MIT, `bpf/` GPL-2.0.
