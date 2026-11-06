@@ -3,13 +3,15 @@
 //!
 //! The kernel program lives in `bpf/kcart.bpf.c`, is compiled by `build.rs`
 //! and embedded as [`BPF_OBJECT`]. [`abi`] mirrors the shared header,
-//! [`hosts`] turns hostnames into trie keys and [`events`] decodes drop
-//! events from the ring buffer.
+//! [`hosts`] turns hostnames into trie keys, [`events`] decodes drop
+//! events from the ring buffer and [`sockets`] finds the server's listeners
+//! for the socket check.
 
 pub mod abi;
 pub mod config;
 pub mod events;
 pub mod hosts;
+pub mod sockets;
 
 /// The compiled XDP object, ready for `aya::EbpfLoader`.
 pub const BPF_OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcart.bpf.o"));

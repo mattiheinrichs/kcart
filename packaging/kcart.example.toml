@@ -38,5 +38,12 @@ allow_legacy_ping = false
 # waiting for its handshake timeout.
 rst = false
 
+# Ask the kernel's socket table before creating or deleting flow state, so
+# spoofed packets can do neither. The server must listen in the same network
+# namespace as the interface (not in a container with its own). "auto" turns
+# it on when every protected port has a listener at startup and on reload,
+# "on" and "off" force it.
+socket_check = "auto"
+
 # "text" or "json", one line per drop event on stdout.
 log_format = "text"

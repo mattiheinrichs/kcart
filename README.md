@@ -19,7 +19,13 @@ The kernel has already accepted the connection at that point. Without the
 reset it sits in the server until the handshake timeout, with it the socket
 is closed right away.
 
-Numbers from a single vCPU: about 55 ns per player packet, about 170 ns per
+Flow state is only created or removed when the kernel confirms the
+connection exists (`socket_check`), so spoofed packets can neither fill the
+flow table nor knock a player out of it. This needs the server in the same
+network namespace as the interface; kcart detects that at startup and warns
+if the server is not visible.
+
+Numbers from a single vCPU: about 60 ns per player packet, about 170 ns per
 rejected handshake. [docs/DESIGN.md](docs/DESIGN.md) has the details,
 including what it took to get the parser past the BPF verifier.
 
@@ -72,6 +78,9 @@ characters are letters, digits, `-`, `.`, `_` and `:`, use punycode for
 anything else. Keep in mind that connecting by IP stops working for
 everyone, the server list ping included.
 
+`--allow-legacy-ping` lets pre 1.7 server list pings through. They carry no
+hostname, so with it on, scanners get the server status again.
+
 ### Running as a service
 
 ```
@@ -86,7 +95,7 @@ systemctl enable --now kcart
 `make test-bpf` (root) runs the XDP program against crafted frames through
 `BPF_PROG_TEST_RUN`, `make bench-bpf` prints ns per packet, `cargo test`
 covers the loader, `sudo scripts/integration.sh` makes real TCP connections
-through a veth pair.
+through a veth pair and injects spoofed packets against them.
 
 ## Limitations
 
@@ -94,6 +103,14 @@ Whoever knows your domain gets through. This is not DDoS protection, and
 SYN floods are still the kernel's business. Bedrock (UDP) is not covered.
 If `nstat -az TcpInCsumErrors` climbs with `--rst` on, the driver does not
 like modified packets; turn the reset off.
+
+kcart only sees what arrives on the interface as plain TCP. Traffic inside
+GRE, IPIP or IPsec tunnels that the host terminates is decapsulated after
+XDP and bypasses it. In front of a BungeeCord or Velocity backend, kcart
+checks the hostname but not the forwarding secret; the backend still has to
+reject direct connections itself. If the server runs in a container with its
+own network namespace, the socket check is off and spoofed packets can
+disturb flow state; run the container with host networking to get it back.
 
 Tested on Debian 12, kernel 6.1, virtio_net.
 

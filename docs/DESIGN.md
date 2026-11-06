@@ -17,8 +17,8 @@ For every received frame:
    extension headers), TCP. Anything that is not TCP to a protected port
    passes untouched. This path costs a few comparisons and one array lookup.
 2. A SYN deletes any flow state for the 4-tuple, because a client may reuse
-   a port after TIME_WAIT. Packets without payload pass. FIN and RST delete
-   the flow state too.
+   a port after TIME_WAIT. Packets without payload pass. FIN and RST never
+   touch flow state.
 3. A packet with payload is looked up in the flow map. A hit means the
    handshake was already verified: pass. This is the hot path for player
    traffic, one LRU hash lookup per packet.
@@ -31,7 +31,31 @@ For every received frame:
    garbage like HTTP probes.
 
 Payload length is taken from the IP header, not from the frame length, so
-Ethernet padding on small frames does not look like data.
+Ethernet padding on small frames does not look like data. IPv6 extension
+header chains are walked up to eight headers, including AH; a longer chain
+cannot be parsed and is dropped on every port, since the kernel would still
+deliver it.
+
+## Spoofing
+
+Everything above works on single frames with nothing but their own content
+as evidence, and TCP header flags are trivial to spoof. Two attacks follow
+from a naive design: a spoofed SYN on a player's 4-tuple would delete the
+flow entry and the player's next packet would be treated as a failed
+handshake, and spoofed packets with a valid handshake would create flow
+entries for connections that do not exist until the LRU evicts real
+players. Finding a player's source port is a matter of 65535 packets.
+
+With the socket check on, kcart asks the kernel through
+`bpf_skc_lookup_tcp` before it touches flow state. A SYN only deletes when
+no established or half open socket exists for the tuple (a TIME_WAIT socket
+counts as gone, so port reuse keeps working), and a valid handshake only
+creates an entry when such a socket exists. The hot path is unchanged. The
+lookup only sees the interface's network namespace, which is why the loader
+checks for a listener on the protected ports in `/proc/net/tcp` and warns
+when the server is not visible; in that case kcart falls back to the naive
+behaviour. `bpf_tcp_sock`, which would allow checking sequence numbers and
+bytes received, is not available to XDP programs.
 
 ## Hostname matching
 
@@ -48,7 +72,8 @@ appends `\0FML3\0` and BungeeCord's IP forwarding appends
 by OR-ing every byte with 0x20, which the loader applies to stored entries
 the same way. That fold is branch free and maps ASCII letters to lowercase;
 it also maps a few punctuation characters onto others (`[` and `{`, `_` and
-DEL), which cannot occur in a hostname.
+DEL), which cannot occur in a hostname, and would map control characters
+onto printable ones, so names containing bytes below 0x20 are rejected.
 
 ## Verifier notes
 
@@ -60,8 +85,7 @@ quadratic and four VarInts of one to five bytes each multiply that by
 hundreds. A straightforward implementation needs far more than the one
 million instruction budget.
 
-kcart keeps the verifier cost at roughly 300k instructions (150k without
-reset mode) with two techniques:
+kcart keeps the verifier cost well under the budget with two techniques:
 
 - Indices are masked (`& 0xff`) right where they are used, with buffers
   sized to 256 bytes. The mask never changes a value that is in range, but
@@ -75,6 +99,11 @@ reset mode) with two techniques:
 
 The per-CPU scratch map also holds the 260 byte trie key and the hostname
 copy, which do not fit the 512 byte BPF stack next to everything else.
+
+The socket lookup and the reset path are placed on paths that return
+immediately and are fed laundered offsets, otherwise their verification
+would be repeated for every state the parser leaves behind. With both, the
+program needs about 360k instructions.
 
 The same pointer arithmetic is why the loader needs CAP_PERFMON besides
 CAP_BPF and CAP_NET_ADMIN: without it the verifier runs in its unprivileged
@@ -111,11 +140,11 @@ average per packet:
 | path | ns |
 |---|---|
 | TCP to another port | 20 |
-| pure ACK on a protected port | 26 |
-| data packet of a known flow | 56 |
-| handshake, allowed, exact or wildcard | 119 |
-| handshake, denied (bare IP) | 166 |
-| handshake, denied, 255 character hostname | 508 |
-| garbage payload (HTTP probe) | 109 |
+| pure ACK on a protected port | 28 |
+| data packet of a known flow | 60 |
+| handshake, allowed, exact or wildcard | 144 |
+| handshake, denied (bare IP) | 173 |
+| handshake, denied, 255 character hostname | 642 |
+| garbage payload (HTTP probe) | 114 |
 
 `make bench-bpf` reproduces the table.

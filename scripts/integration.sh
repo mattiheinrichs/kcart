@@ -33,6 +33,8 @@ ip netns exec $NS ip link set lo up
 
 python3 "$TESTS/fake_server.py" $HOST_IP > /tmp/kcart-it-server.log 2>&1 &
 SERVER_PID=$!
+# kcart looks for the listener at startup, so the server must be up first
+until ss -ltn "sport = :25565" | grep -q LISTEN; do sleep 0.1; done
 "$KCART" run --iface kc0 --port 25565 --host play.example.com --host '*.wild.example.org' \
 	--pin-dir $PIN --rst > /tmp/kcart-it-kcart.log 2>&1 &
 KCART_PID=$!
@@ -62,10 +64,22 @@ expect "no reply" $HOST_IP
 expect "no reply" wild.example.org
 expect "no reply" example.com
 
+if ip netns exec $NS python3 "$TESTS/spoof.py" kc1 $HOST_IP play.example.com; then
+	:
+else
+	fail=1
+fi
+
 echo
 "$KCART" stats --pin-dir $PIN
 echo
 grep -c "drop reason=host_not_allowed" /tmp/kcart-it-kcart.log | sed 's/^/drop events logged: /'
+if grep -q "socket check on" /tmp/kcart-it-kcart.log; then
+	echo "ok   socket check detected the server"
+else
+	echo "FAIL socket check not on"
+	fail=1
+fi
 if grep -q "Connection reset" /tmp/kcart-it-server.log; then
 	echo "ok   server saw resets for denied connections"
 else

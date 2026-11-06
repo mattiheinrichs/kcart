@@ -22,6 +22,9 @@ pub const AF_INET6: u8 = 10;
 pub const F_ALLOW_LEGACY_PING: u32 = 1 << 0;
 /// `kcart_config.flags` bit: answer dropped handshakes with a TCP RST.
 pub const F_RST: u32 = 1 << 1;
+/// `kcart_config.flags` bit: ask the kernel's socket table before touching
+/// flow state, so spoofed packets can neither create nor delete entries.
+pub const F_SOCKET_CHECK: u32 = 1 << 2;
 
 /// Value of an exact hosts trie entry.
 pub const HOST_EXACT: u8 = 1;
@@ -110,11 +113,13 @@ pub enum Reason {
     DropMalformed = 6,
     DropTruncated = 7,
     DropLegacyPing = 8,
+    PassNoSocket = 9,
+    DropExtHeaders = 10,
 }
 
 impl Reason {
     /// `KCART_REASON_MAX`, the number of stats slots.
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 11;
 
     pub const ALL: [Reason; Self::COUNT] = [
         Reason::PassNoPayload,
@@ -126,6 +131,8 @@ impl Reason {
         Reason::DropMalformed,
         Reason::DropTruncated,
         Reason::DropLegacyPing,
+        Reason::PassNoSocket,
+        Reason::DropExtHeaders,
     ];
 
     pub fn from_u8(value: u8) -> Option<Reason> {
@@ -144,6 +151,7 @@ impl Reason {
                 | Reason::DropMalformed
                 | Reason::DropTruncated
                 | Reason::DropLegacyPing
+                | Reason::DropExtHeaders
         )
     }
 
@@ -166,6 +174,8 @@ impl Reason {
             Reason::DropMalformed => "malformed",
             Reason::DropTruncated => "truncated",
             Reason::DropLegacyPing => "legacy_ping",
+            Reason::PassNoSocket => "no_socket",
+            Reason::DropExtHeaders => "ext_headers",
         }
     }
 }
@@ -206,6 +216,7 @@ mod tests {
         assert_eq!(HOST_WILDCARD, header_define("KCART_HOST_WILDCARD") as u8);
         assert!(HEADER.contains("#define KCART_F_ALLOW_LEGACY_PING (1u << 0)"));
         assert!(HEADER.contains("#define KCART_F_RST (1u << 1)"));
+        assert!(HEADER.contains("#define KCART_F_SOCKET_CHECK (1u << 2)"));
     }
 
     #[test]

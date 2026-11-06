@@ -22,7 +22,7 @@ MAX_HOST = 255
 REASONS = [
     "pass_no_payload", "pass_known_flow", "pass_handshake_ok", "pass_legacy_ping",
     "drop_host_not_allowed", "drop_host_too_long", "drop_malformed",
-    "drop_truncated", "drop_legacy_ping",
+    "drop_truncated", "drop_legacy_ping", "pass_no_socket", "drop_ext_headers",
 ]
 
 
@@ -78,13 +78,19 @@ def ipv4_frame(payload, sport=None, dport=25565, flags=0x18, vlan=False, pad=0, 
     return eth + ip + tcp + payload + b"\0" * pad
 
 
-def ipv6_frame(payload, sport=None, dport=25565, flags=0x18, hopbyhop=False):
+def ipv6_frame(payload, sport=None, dport=25565, flags=0x18, hopbyhop=False, ext_chain=()):
+    """ext_chain lists extension header types in order; hopbyhop is shorthand for (0,)."""
     tcp = tcp_header(sport or SPORT, dport, flags)
+    if hopbyhop:
+        ext_chain = (0,)
     ext = b""
     nexthdr = 6
-    if hopbyhop:
-        ext = bytes([6, 0]) + b"\0" * 6
-        nexthdr = 0
+    for kind in reversed(ext_chain):
+        if kind == 51:
+            ext = bytes([nexthdr, 1, 0, 0, 0, 0, 0, 0]) + b"\0" * 4 + ext
+        else:
+            ext = bytes([nexthdr, 0]) + b"\0" * 6 + ext
+        nexthdr = kind
     ip = struct.pack("!IHBB16s16s", 0x60000000, len(ext) + len(tcp) + len(payload), nexthdr, 64,
                      bytes.fromhex("20010db8000000000000000000000002"),
                      bytes.fromhex("20010db8000000000000000000000001"))
@@ -287,9 +293,9 @@ case("flow: handshake then data passes",
      [ipv4_frame(ok, sport=50001), ipv4_frame(b"\x05\x00abcd", sport=50001)], [XDP_PASS, XDP_PASS])
 case("flow: data without handshake drops",
      [ipv4_frame(b"\x05\x00abcd", sport=50002), ipv4_frame(b"\x05\x00abcd", sport=50002)], [XDP_DROP, XDP_DROP])
-case("flow: fin with data passes and forgets flow",
+case("flow: fin with data still passes",
      [ipv4_frame(ok, sport=50003), ipv4_frame(b"\x05\x00abcd", sport=50003, flags=0x19),
-      ipv4_frame(b"\x05\x00abcd", sport=50003)], [XDP_PASS, XDP_PASS, XDP_DROP])
+      ipv4_frame(b"\x05\x00abcd", sport=50003)], [XDP_PASS, XDP_PASS, XDP_PASS])
 case("flow: syn resets state for reused tuple",
      [ipv4_frame(ok, sport=50004), ipv4_frame(b"", sport=50004, flags=0x02),
       ipv4_frame(b"\x05\x00abcd", sport=50004)], [XDP_PASS, XDP_PASS, XDP_DROP])
@@ -300,6 +306,16 @@ case("flow: denied handshake leaves no state",
       ipv4_frame(b"\x05\x00abcd", sport=50006)], [XDP_DROP, XDP_PASS, XDP_PASS])
 case("ipv6 flow: handshake then data",
      [ipv6_frame(ok, sport=50007), ipv6_frame(b"\x05\x00abcd", sport=50007)], [XDP_PASS, XDP_PASS])
+case("ipv6 ah header, denied", [ipv6_frame(handshake("1.2.3.4"), ext_chain=(51,))], [XDP_DROP])
+case("ipv6 ah header, allowed", [ipv6_frame(ok, ext_chain=(51,))], [XDP_PASS])
+case("ipv6 seven headers, allowed", [ipv6_frame(ok, ext_chain=(0, 60, 43, 51, 60, 60, 60))], [XDP_PASS])
+case("ipv6 nine headers, dropped", [ipv6_frame(ok, ext_chain=(60,) * 9)], [XDP_DROP])
+case("ipv6 nine headers, other port, dropped too",
+     [ipv6_frame(ok, dport=80, ext_chain=(60,) * 9)], [XDP_DROP])
+case("control character folds onto dot", [ipv4_frame(handshake("play\x0eexample\x0ecom"))], [XDP_DROP])
+case("flow: spoofed fin does not forget flow",
+     [ipv4_frame(ok, sport=50008), ipv4_frame(b"", sport=50008, flags=0x11),
+      ipv4_frame(b"\x05\x00abcd", sport=50008)], [XDP_PASS, XDP_PASS, XDP_PASS])
 
 
 def main():
@@ -324,6 +340,27 @@ def main():
     for reason, count in stats().items():
         print(f"{reason:24} {count}")
 
+    # With the socket check on and no sockets behind the test frames, a valid
+    # handshake passes but creates no flow state.
+    set_flags(4)
+    socket_cases = [
+        ("socket check: handshake passes without state",
+         [ipv4_frame(ok, sport=62000), ipv4_frame(b"\x05\x00abcd", sport=62000)], [XDP_PASS, XDP_DROP]),
+        ("socket check: syn without socket still deletes",
+         [ipv4_frame(b"", sport=62001, flags=0x02)], [XDP_PASS]),
+        ("socket check: ipv6 handshake passes without state",
+         [ipv6_frame(ok, sport=62002), ipv6_frame(b"\x05\x00abcd", sport=62002)], [XDP_PASS, XDP_DROP]),
+    ]
+    for name, frames, expect in socket_cases:
+        got = [run(f) for f in frames]
+        print(f"{'ok' if got == expect else 'FAIL':4} {name}: {got} expected {expect}")
+        if got != expect:
+            failed += 1
+    no_socket = stats()["pass_no_socket"]
+    print(f"{'ok' if no_socket == 2 else 'FAIL':4} socket check: pass_no_socket counted {no_socket} (expected 2)")
+    if no_socket != 2:
+        failed += 1
+
     set_flags(2)
     rst_cases = [
         ("ipv4 denied handshake", ipv4_frame(handshake("1.2.3.4"), sport=61000)),
@@ -332,7 +369,7 @@ def main():
         ("ipv6 denied handshake", ipv6_frame(handshake("1.2.3.4"), sport=61003)),
         ("vlan denied handshake", ipv4_frame(handshake("1.2.3.4"), sport=61004, vlan=True)),
     ]
-    total = len(CASES) + len(rst_cases) + 1
+    total = len(CASES) + len(socket_cases) + 1 + len(rst_cases) + 1
     for name, frame in rst_cases:
         if not check_rst(name, frame):
             failed += 1

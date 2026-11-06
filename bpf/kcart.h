@@ -47,6 +47,10 @@ enum kcart_reason {
 	KCART_DROP_MALFORMED,
 	KCART_DROP_TRUNCATED,
 	KCART_DROP_LEGACY_PING,
+	/* Valid handshake, but the kernel has no socket for the tuple. */
+	KCART_PASS_NO_SOCKET,
+	/* IPv6 extension header chain too long to parse, any port. */
+	KCART_DROP_EXT_HEADERS,
 	KCART_REASON_MAX,
 };
 
@@ -58,6 +62,13 @@ enum kcart_reason {
  * server wait for its handshake timeout.
  */
 #define KCART_F_RST (1u << 1)
+/*
+ * Consult the kernel's socket table before creating or deleting flow
+ * state. Spoofed packets can then neither poison the flow map nor knock
+ * out a player's entry. Needs the server in the same network namespace as
+ * the interface.
+ */
+#define KCART_F_SOCKET_CHECK (1u << 2)
 
 struct kcart_config {
 	__u32 flags;

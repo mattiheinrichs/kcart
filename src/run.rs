@@ -11,9 +11,10 @@ use aya::programs::{ProgramError, Xdp, XdpMode};
 use aya::{Ebpf, EbpfLoader};
 use clap::Args;
 use kcart::abi;
-use kcart::config::{Config, LogFormat, Mode, PartialConfig};
+use kcart::config::{Config, LogFormat, Mode, PartialConfig, SocketCheck};
 use kcart::events::DropEvent;
 use kcart::hosts::HostPattern;
+use kcart::sockets;
 use log::{error, info, warn};
 use tokio::io::unix::AsyncFd;
 use tokio::signal::unix::{signal, SignalKind};
@@ -50,6 +51,9 @@ pub struct RunArgs {
     /// Answer dropped handshakes with a TCP RST so the server closes the socket
     #[arg(long)]
     rst: bool,
+    /// Consult the kernel socket table before touching flow state; auto means on when the server listens in this netns
+    #[arg(long, value_enum)]
+    socket_check: Option<SocketCheck>,
     /// Format of the drop event lines on stdout
     #[arg(long, value_enum)]
     log_format: Option<LogFormat>,
@@ -69,6 +73,7 @@ impl RunArgs {
             events_per_sec: self.events_per_sec,
             allow_legacy_ping: self.allow_legacy_ping.then_some(true),
             rst: self.rst.then_some(true),
+            socket_check: self.socket_check,
             log_format: self.log_format,
         }
     }
@@ -88,11 +93,12 @@ fn load_config(path: Option<&Path>, overrides: &PartialConfig) -> Result<Config>
 
 pub fn run(args: RunArgs) -> Result<()> {
     let overrides = args.overrides();
-    let config = load_config(args.config.as_deref(), &overrides)?;
+    let mut config = load_config(args.config.as_deref(), &overrides)?;
     logger::init(config.log_format)?;
     for warning in config.warnings() {
         warn!("{warning}");
     }
+    resolve_socket_check(&mut config);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -161,12 +167,13 @@ async fn run_filter(
     let iface = CString::new(config.interface.as_str()).context("interface name")?;
     let (link, mode) = attach(program, &iface, config.mode)?;
     info!(
-        "attached to {} in {mode} mode, ports {}, {} hosts, allow_legacy_ping={}, rst={}, pins under {}",
+        "attached to {} in {mode} mode, ports {}, {} hosts, allow_legacy_ping={}, rst={}, socket_check={}, pins under {}",
         config.interface,
         ports_list(&config.ports),
         config.hosts.len(),
         config.allow_legacy_ping,
         config.rst,
+        config.socket_check,
         pin_dir.path().display()
     );
 
@@ -265,13 +272,14 @@ fn reload(
         warn!("got SIGHUP but no config file was given, nothing to reload");
         return;
     };
-    let next = match load_config(Some(path), overrides) {
+    let mut next = match load_config(Some(path), overrides) {
         Ok(next) => next,
         Err(err) => {
             error!("reload failed, keeping the running config: {err:#}");
             return;
         }
     };
+    resolve_socket_check(&mut next);
     if let Err(err) = apply(maps, Some(current), &next) {
         error!("reload failed while updating the maps: {err:#}");
         return;
@@ -299,6 +307,40 @@ fn reload(
         next.hosts.len()
     );
     *current = next;
+}
+
+/// Turns `auto` into `on` or `off` by looking for the server's listeners.
+fn resolve_socket_check(config: &mut Config) {
+    if config.socket_check != SocketCheck::Auto {
+        info!("socket check {} (configured)", config.socket_check);
+        return;
+    }
+    config.socket_check = match sockets::listening(&config.ports) {
+        Ok(found) if found == config.ports => {
+            info!(
+                "socket check on (listener found on ports {})",
+                ports_list(&found)
+            );
+            SocketCheck::On
+        }
+        Ok(found) => {
+            let missing: Vec<u16> = config
+                .ports
+                .iter()
+                .copied()
+                .filter(|port| !found.contains(port))
+                .collect();
+            warn!(
+                "socket check off: no listener on ports {} in this network namespace, spoofed packets can create or delete flow state; set socket_check = \"on\" if the server is started later or \"off\" to silence this warning",
+                ports_list(&missing)
+            );
+            SocketCheck::Off
+        }
+        Err(err) => {
+            warn!("socket check off: {err:#}");
+            SocketCheck::Off
+        }
+    };
 }
 
 /// Brings the maps in line with `next`. `previous` is what the maps hold now,

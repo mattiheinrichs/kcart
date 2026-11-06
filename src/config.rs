@@ -1,5 +1,6 @@
 //! The TOML config file and the CLI flags that override it.
 
+use std::fmt;
 use std::fs;
 use std::path::Path;
 
@@ -36,6 +37,29 @@ pub enum LogFormat {
     Json,
 }
 
+/// Whether the XDP program consults the kernel's socket table before it
+/// creates or deletes flow state. Only works when the server's sockets live
+/// in the same network namespace as the interface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum SocketCheck {
+    /// On when every protected port has a listener at startup and on reload
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl fmt::Display for SocketCheck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            SocketCheck::Auto => "auto",
+            SocketCheck::On => "on",
+            SocketCheck::Off => "off",
+        })
+    }
+}
+
 /// Config with every field optional: the shape of the file and of the CLI flags.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +72,7 @@ pub struct PartialConfig {
     pub events_per_sec: Option<u32>,
     pub allow_legacy_ping: Option<bool>,
     pub rst: Option<bool>,
+    pub socket_check: Option<SocketCheck>,
     pub log_format: Option<LogFormat>,
 }
 
@@ -62,6 +87,8 @@ pub struct Config {
     pub events_per_sec: u32,
     pub allow_legacy_ping: bool,
     pub rst: bool,
+    /// `Auto` until the loader has looked for the server's listeners.
+    pub socket_check: SocketCheck,
     pub log_format: LogFormat,
 }
 
@@ -87,6 +114,7 @@ impl PartialConfig {
             events_per_sec: overrides.events_per_sec.or(self.events_per_sec),
             allow_legacy_ping: overrides.allow_legacy_ping.or(self.allow_legacy_ping),
             rst: overrides.rst.or(self.rst),
+            socket_check: overrides.socket_check.or(self.socket_check),
             log_format: overrides.log_format.or(self.log_format),
         }
     }
@@ -137,6 +165,7 @@ impl PartialConfig {
             events_per_sec: self.events_per_sec.unwrap_or(EVENTS_PER_SEC_DEFAULT),
             allow_legacy_ping: self.allow_legacy_ping.unwrap_or(false),
             rst: self.rst.unwrap_or(false),
+            socket_check: self.socket_check.unwrap_or_default(),
             log_format: self.log_format.unwrap_or_default(),
         })
     }
@@ -166,6 +195,9 @@ impl Config {
         if self.rst {
             flags |= abi::F_RST;
         }
+        if self.socket_check == SocketCheck::On {
+            flags |= abi::F_SOCKET_CHECK;
+        }
         abi::Config {
             flags,
             events_per_sec: self.events_per_sec,
@@ -186,6 +218,7 @@ flows_max = 1000
 events_per_sec = 5
 allow_legacy_ping = true
 rst = true
+socket_check = "on"
 log_format = "json"
 "#;
 
@@ -206,11 +239,12 @@ log_format = "json"
         assert_eq!(config.events_per_sec, 5);
         assert!(config.allow_legacy_ping);
         assert!(config.rst);
+        assert_eq!(config.socket_check, SocketCheck::On);
         assert_eq!(config.log_format, LogFormat::Json);
         assert_eq!(
             config.bpf_config(),
             abi::Config {
-                flags: abi::F_ALLOW_LEGACY_PING | abi::F_RST,
+                flags: abi::F_ALLOW_LEGACY_PING | abi::F_RST | abi::F_SOCKET_CHECK,
                 events_per_sec: 5
             }
         );
@@ -228,6 +262,7 @@ log_format = "json"
         assert_eq!(config.events_per_sec, EVENTS_PER_SEC_DEFAULT);
         assert!(!config.allow_legacy_ping);
         assert!(!config.rst);
+        assert_eq!(config.socket_check, SocketCheck::Auto);
         assert_eq!(config.log_format, LogFormat::Text);
         assert!(config.hosts.is_empty());
         assert_eq!(config.warnings().len(), 1);
@@ -248,6 +283,20 @@ log_format = "json"
         assert_eq!(config.ports, vec![1]);
         assert!(config.hosts.is_empty());
         assert_eq!(config.mode, Mode::Skb);
+        assert_eq!(config.socket_check, SocketCheck::On);
+    }
+
+    #[test]
+    fn socket_check_flag_follows_the_resolved_value() {
+        let mut config = PartialConfig::parse("interface = \"eth0\"\n")
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(config.bpf_config().flags, 0);
+        config.socket_check = SocketCheck::On;
+        assert_eq!(config.bpf_config().flags, abi::F_SOCKET_CHECK);
+        config.socket_check = SocketCheck::Off;
+        assert_eq!(config.bpf_config().flags, 0);
     }
 
     #[test]
@@ -284,5 +333,6 @@ log_format = "json"
         let text = toml::to_string(&config).unwrap();
         assert!(text.contains("hosts = [\"play.example.com\", \"*.example.com\"]"));
         assert!(text.contains("mode = \"skb\""));
+        assert!(text.contains("socket_check = \"on\""));
     }
 }

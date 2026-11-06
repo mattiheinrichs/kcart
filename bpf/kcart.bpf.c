@@ -24,6 +24,7 @@
 #define IPPROTO_TCP 6
 #define IPPROTO_ROUTING 43
 #define IPPROTO_FRAGMENT 44
+#define IPPROTO_AH 51
 #define IPPROTO_DSTOPTS 60
 #define IPPROTO_MH 135
 
@@ -37,9 +38,19 @@
 #define IPV6_HLEN 40
 #define TCP_MIN_HLEN 20
 
-/* Six extension headers of at most 2048 bytes each fit under the mask. */
-#define IPV6_EXT_MAX 6
-#define IPV6_EXT_MASK 0x3fff
+/*
+ * RFC 8200 allows each extension header once, destination options twice:
+ * eight is more than any legitimate chain. Eight headers of at most 2048
+ * bytes fit under the mask.
+ */
+#define IPV6_EXT_MAX 8
+#define IPV6_EXT_MASK 0x7fff
+
+enum l3_status {
+	L3_TCP,
+	L3_NOT_OURS,
+	L3_DROP,
+};
 
 #define FLOWS_DEFAULT_MAX 262144
 #define HOSTS_MAX 1024
@@ -266,7 +277,8 @@ static __always_inline __u8 copy_host(const __u8 *host, const __u8 *end,
 /*
  * Builds the trie key from sc->raw: cut at the first NUL (Forge and
  * BungeeCord append "\0..." to the hostname), strip one trailing dot,
- * reverse and fold case. Returns the effective hostname length.
+ * reverse and fold case. Returns the effective hostname length, or 0 when
+ * the name contains a control character.
  */
 static __always_inline __u32 build_host_key(struct kcart_scratch *sc, __u32 hlen)
 {
@@ -287,18 +299,26 @@ static __always_inline __u32 build_host_key(struct kcart_scratch *sc, __u32 hlen
 	eff = launder(sc, eff, KCART_HOST_IDX_MASK);
 
 	sc->key.prefixlen = KCART_HOST_KEY_LEN * 8;
+	__u32 control = 0;
+
 	for (__u32 i = 0; i < KCART_MAX_HOST; i++) {
 		if (i >= eff)
 			break;
 		__u32 j = (eff - 1 - i) & KCART_HOST_IDX_MASK;
+		__u32 c = sc->raw[j];
 
-		/* Branch free case folding, userspace stores keys the same way. */
-		sc->key.data[i] = sc->raw[j] | 0x20;
+		/*
+		 * Both branch free: the fold ORs in the case bit, userspace stores
+		 * keys the same way. Control characters would fold onto printable
+		 * ones (0x0e onto '.'), so they are flagged and rejected below.
+		 */
+		control |= ((c >> 5) - 1) >> 31;
+		sc->key.data[i] = c | 0x20;
 	}
 	eff = launder(sc, eff, KCART_HOST_IDX_MASK);
 	/* The scratch memory is reused, the terminator must be written each time. */
 	sc->key.data[eff] = 0;
-	return eff;
+	return control ? 0 : eff;
 }
 
 /*
@@ -383,6 +403,8 @@ static __always_inline __u8 parse_handshake(const __u8 *cur, const __u8 *end,
 	if (reason)
 		return reason;
 	*host_len = build_host_key(sc, hlen);
+	if (!*host_len)
+		return KCART_DROP_MALFORMED;
 	return 0;
 }
 
@@ -430,44 +452,54 @@ static __always_inline void emit_event(const struct kcart_config *cfg,
 }
 
 /*
- * Returns the TCP header or NULL. l4_len receives the length IP claims for
- * it, l4_off the offset of the TCP header from l3.
+ * Finds the TCP header behind an IPv4 header. l4_len receives the length IP
+ * claims for it, l4_off the offset of the TCP header from l3.
  */
-static __always_inline struct tcphdr *parse_ipv4(void *l3, void *data_end,
+static __always_inline enum l3_status parse_ipv4(void *l3, void *data_end,
 						 struct kcart_flow_key *flow,
+						 struct tcphdr **tcp,
 						 __u32 *l4_len, __u32 *l4_off)
 {
 	struct iphdr *ip = l3;
 
 	if ((void *)(ip + 1) > data_end)
-		return NULL;
+		return L3_NOT_OURS;
 	if (ip->protocol != IPPROTO_TCP)
-		return NULL;
+		return L3_NOT_OURS;
 	if (ip->frag_off & bpf_htons(0x1fff))
-		return NULL;
+		return L3_NOT_OURS;
 
 	__u32 ihl = (ip->version_ihl & 0x0f) * 4;
 	__u32 tot_len = bpf_ntohs(ip->tot_len);
 
 	if (ihl < sizeof(*ip) || tot_len < ihl)
-		return NULL;
+		return L3_NOT_OURS;
 
 	flow->family = KCART_AF_INET;
 	flow->saddr[0] = ip->saddr;
 	flow->daddr[0] = ip->daddr;
 	*l4_len = tot_len - ihl;
 	*l4_off = ihl;
-	return l3 + ihl;
+	*tcp = l3 + ihl;
+	return L3_TCP;
 }
 
-static __always_inline struct tcphdr *parse_ipv6(void *l3, void *data_end,
+static __always_inline int ipv6_is_ext(__u8 nexthdr)
+{
+	return nexthdr == IPPROTO_HOPOPTS || nexthdr == IPPROTO_ROUTING ||
+	       nexthdr == IPPROTO_DSTOPTS || nexthdr == IPPROTO_MH ||
+	       nexthdr == IPPROTO_FRAGMENT || nexthdr == IPPROTO_AH;
+}
+
+static __always_inline enum l3_status parse_ipv6(void *l3, void *data_end,
 						 struct kcart_flow_key *flow,
+						 struct tcphdr **tcp,
 						 __u32 *l4_len, __u32 *l4_off)
 {
 	struct ipv6hdr *ip6 = l3;
 
 	if ((void *)(ip6 + 1) > data_end)
-		return NULL;
+		return L3_NOT_OURS;
 
 	__u8 nexthdr = ip6->nexthdr;
 	__u32 ext_len = 0;
@@ -484,48 +516,92 @@ static __always_inline struct tcphdr *parse_ipv6(void *l3, void *data_end,
 		struct kcart_scratch *sc = bpf_map_lookup_elem(&scratch, &zero);
 
 		if (!sc)
-			return NULL;
+			return L3_NOT_OURS;
 		for (int i = 0; i < IPV6_EXT_MAX; i++) {
-			if (nexthdr == IPPROTO_TCP)
+			if (!ipv6_is_ext(nexthdr))
 				break;
-			if (nexthdr == IPPROTO_HOPOPTS || nexthdr == IPPROTO_ROUTING ||
-			    nexthdr == IPPROTO_DSTOPTS || nexthdr == IPPROTO_MH) {
-				struct ipv6_opthdr *opt = cur;
-
-				if ((void *)(opt + 1) > data_end)
-					return NULL;
-				nexthdr = opt->nexthdr;
-				ext_len += ((__u32)opt->hdrlen + 1) * 8;
-			} else if (nexthdr == IPPROTO_FRAGMENT) {
+			if (nexthdr == IPPROTO_FRAGMENT) {
 				struct ipv6_fraghdr *frag = cur;
 
 				if ((void *)(frag + 1) > data_end)
-					return NULL;
+					return L3_NOT_OURS;
 				if (frag->frag_off & bpf_htons(0xfff8))
-					return NULL;
+					return L3_NOT_OURS;
 				nexthdr = frag->nexthdr;
 				ext_len += sizeof(*frag);
 			} else {
-				return NULL;
+				struct ipv6_opthdr *opt = cur;
+
+				if ((void *)(opt + 1) > data_end)
+					return L3_NOT_OURS;
+				/* AH counts its length in 32 bit words, the others in 64 bit. */
+				if (nexthdr == IPPROTO_AH)
+					ext_len += ((__u32)opt->hdrlen + 2) * 4;
+				else
+					ext_len += ((__u32)opt->hdrlen + 1) * 8;
+				nexthdr = opt->nexthdr;
 			}
 			ext_len = launder(sc, ext_len, IPV6_EXT_MASK);
 			cur = (void *)(ip6 + 1) + ext_len;
 		}
+		/* A chain this long cannot be parsed, so it cannot be let through. */
+		if (ipv6_is_ext(nexthdr))
+			return L3_DROP;
 		if (nexthdr != IPPROTO_TCP)
-			return NULL;
+			return L3_NOT_OURS;
 	}
 
 	__u32 payload_len = bpf_ntohs(ip6->payload_len);
 
 	if (payload_len < ext_len)
-		return NULL;
+		return L3_NOT_OURS;
 
 	flow->family = KCART_AF_INET6;
 	__builtin_memcpy(flow->saddr, ip6->saddr, 16);
 	__builtin_memcpy(flow->daddr, ip6->daddr, 16);
 	*l4_len = payload_len - ext_len;
 	*l4_off = IPV6_HLEN + ext_len;
-	return cur;
+	*tcp = cur;
+	return L3_TCP;
+}
+
+/*
+ * Asks the kernel whether a connection exists for the flow: established, or
+ * still a request socket when the handshake data rides on the final ACK.
+ * The lookup falls back to the listener for unknown tuples, hence the state
+ * check.
+ */
+static __always_inline int socket_alive(struct xdp_md *ctx,
+					const struct kcart_flow_key *flow)
+{
+	struct bpf_sock_tuple tuple = {};
+	__u32 size;
+
+	if (flow->family == KCART_AF_INET) {
+		tuple.ipv4.saddr = flow->saddr[0];
+		tuple.ipv4.daddr = flow->daddr[0];
+		tuple.ipv4.sport = flow->sport;
+		tuple.ipv4.dport = flow->dport;
+		size = sizeof(tuple.ipv4);
+	} else {
+		__builtin_memcpy(tuple.ipv6.saddr, flow->saddr, 16);
+		__builtin_memcpy(tuple.ipv6.daddr, flow->daddr, 16);
+		tuple.ipv6.sport = flow->sport;
+		tuple.ipv6.dport = flow->dport;
+		size = sizeof(tuple.ipv6);
+	}
+
+	struct bpf_sock *sk = bpf_skc_lookup_tcp(ctx, &tuple, size,
+						 BPF_F_CURRENT_NETNS, 0);
+
+	if (!sk)
+		return 0;
+
+	__u32 state = sk->state;
+
+	bpf_sk_release(sk);
+	return state == BPF_TCP_ESTABLISHED || state == BPF_TCP_SYN_RECV ||
+	       state == BPF_TCP_NEW_SYN_RECV;
 }
 
 static __always_inline __u32 csum_fold(__u64 sum)
@@ -561,14 +637,22 @@ static __always_inline __u64 csum_words(const __be16 *words, __u32 count)
  * The sequence number is the one the socket expects next, which is what the
  * stack requires to accept a reset. TCP options are dropped.
  */
-static __always_inline int reset_to_stack(struct xdp_md *ctx, void *l3,
-					  __u8 family, struct tcphdr *tcp,
-					  __u32 l4_off_total)
+static __always_inline int reset_to_stack(struct xdp_md *ctx, __u8 family,
+					  __u32 l3_off, __u32 l4_off_total)
 {
+	void *data = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;
+	void *l3 = data + l3_off;
+	struct tcphdr *tcp = data + l4_off_total;
 	__u64 sum;
 
-	/* The verifier cannot tie family to the parse path, so check again. */
+	/*
+	 * Pin both pointers to their registers, otherwise clang derives the
+	 * bounds checks from data plus offset and the verifier does not carry
+	 * the result over to the pointers used for the writes.
+	 */
+	asm volatile("" : "+r"(l3));
+	asm volatile("" : "+r"(tcp));
 	if ((void *)(tcp + 1) > data_end)
 		return XDP_DROP;
 	if (family == KCART_AF_INET) {
@@ -611,6 +695,24 @@ static __always_inline int reset_to_stack(struct xdp_md *ctx, void *l3,
 	return XDP_PASS;
 }
 
+/*
+ * A SYN reuses the tuple of a finished connection, so the old flow state
+ * goes. With the socket check a SYN against a live connection is a spoof
+ * and leaves the state alone; the kernel answers it with a challenge ACK.
+ * Called only on paths that return right after, the socket lookup is
+ * expensive to verify and must not run into the handshake parser.
+ */
+static __always_inline void forget_on_syn(struct xdp_md *ctx,
+					  const struct kcart_flow_key *flow)
+{
+	__u32 zero = 0;
+	struct kcart_config *cfg = bpf_map_lookup_elem(&config, &zero);
+
+	if (cfg && (cfg->flags & KCART_F_SOCKET_CHECK) && socket_alive(ctx, flow))
+		return;
+	bpf_map_delete_elem(&flows, flow);
+}
+
 SEC("xdp")
 int kcart_xdp(struct xdp_md *ctx)
 {
@@ -639,16 +741,19 @@ int kcart_xdp(struct xdp_md *ctx)
 	}
 
 	struct kcart_flow_key flow = {};
-	struct tcphdr *tcp;
-	__u32 l4_len, l4_off;
+	struct tcphdr *tcp = NULL;
+	__u32 l4_len = 0, l4_off = 0;
+	enum l3_status status;
 
 	if (proto == bpf_htons(ETH_P_IP))
-		tcp = parse_ipv4(l3, data_end, &flow, &l4_len, &l4_off);
+		status = parse_ipv4(l3, data_end, &flow, &tcp, &l4_len, &l4_off);
 	else if (proto == bpf_htons(ETH_P_IPV6))
-		tcp = parse_ipv6(l3, data_end, &flow, &l4_len, &l4_off);
+		status = parse_ipv6(l3, data_end, &flow, &tcp, &l4_len, &l4_off);
 	else
 		return XDP_PASS;
-	if (!tcp || (void *)(tcp + 1) > data_end)
+	if (status == L3_DROP)
+		return verdict(KCART_DROP_EXT_HEADERS, XDP_DROP);
+	if (status != L3_TCP || !tcp || (void *)(tcp + 1) > data_end)
 		return XDP_PASS;
 
 	__u32 port = bpf_ntohs(tcp->dest);
@@ -675,21 +780,19 @@ int kcart_xdp(struct xdp_md *ctx)
 	__u8 flags = tcp->flags;
 	int closing = flags & (TCP_FIN | TCP_RST);
 
-	/* A SYN reuses the tuple of a finished connection, forget the old state. */
-	if (flags & TCP_SYN)
-		bpf_map_delete_elem(&flows, &flow);
-
+	/*
+	 * FIN and RST never delete flow state: they are easy to spoof and the
+	 * next SYN or the LRU cleans up anyway.
+	 */
 	if (payload_len == 0) {
-		if (closing)
-			bpf_map_delete_elem(&flows, &flow);
+		if (flags & TCP_SYN)
+			forget_on_syn(ctx, &flow);
 		return verdict(KCART_PASS_NO_PAYLOAD, XDP_PASS);
 	}
 
-	if (!(flags & TCP_SYN) && bpf_map_lookup_elem(&flows, &flow)) {
-		if (closing)
-			bpf_map_delete_elem(&flows, &flow);
+	/* A SYN with data skips the lookup: whatever state exists is stale. */
+	if (!(flags & TCP_SYN) && bpf_map_lookup_elem(&flows, &flow))
 		return verdict(KCART_PASS_KNOWN_FLOW, XDP_PASS);
-	}
 
 	/* First payload of an unknown flow: this has to be the handshake. */
 	__u32 zero = 0;
@@ -714,23 +817,44 @@ int kcart_xdp(struct xdp_md *ctx)
 		reason = KCART_DROP_LEGACY_PING;
 	} else if (reason == 0) {
 		if (bpf_map_lookup_elem(&hosts, &sc->key)) {
-			if (!closing) {
-				struct kcart_flow state = {
-					.seen_ns = bpf_ktime_get_ns(),
-				};
+			if (closing)
+				return verdict(KCART_PASS_HANDSHAKE_OK, XDP_PASS);
+			/* Without a connection behind it the packet is spoofed or stale. */
+			if ((cfg->flags & KCART_F_SOCKET_CHECK) && !socket_alive(ctx, &flow))
+				return verdict(KCART_PASS_NO_SOCKET, XDP_PASS);
 
-				bpf_map_update_elem(&flows, &flow, &state, BPF_ANY);
-			}
+			struct kcart_flow state = {
+				.seen_ns = bpf_ktime_get_ns(),
+			};
+
+			bpf_map_update_elem(&flows, &flow, &state, BPF_ANY);
 			return verdict(KCART_PASS_HANDSHAKE_OK, XDP_PASS);
 		}
 		reason = KCART_DROP_HOST_NOT_ALLOWED;
 	}
 
+	/*
+	 * The parser leaves one verifier state per hostname length and reason.
+	 * Laundering both lets the verifier check the drop path once instead of
+	 * once per state.
+	 */
+	reason = launder(sc, reason, 0xf);
+	host_len = launder(sc, host_len, KCART_HOST_IDX_MASK);
 	emit_event(cfg, &flow, reason, protocol_version, &sc->key, host_len);
-	if (cfg->flags & KCART_F_RST)
-		return verdict(reason, reset_to_stack(ctx, l3, flow.family, tcp,
-						      l3_off + l4_off));
-	return verdict(reason, XDP_DROP);
+	if (flags & TCP_SYN)
+		forget_on_syn(ctx, &flow);
+	if (!(cfg->flags & KCART_F_RST))
+		return verdict(reason, XDP_DROP);
+
+	/*
+	 * The packet pointers carry a different proven range on every parser
+	 * exit, which also keeps the states apart. Rebuilding them from the
+	 * laundered offsets gives every state the same pointers again.
+	 */
+	__u32 l4_at = launder(sc, l3_off + l4_off, 0x7fff);
+
+	l3_off = launder(sc, l3_off, 0x3f);
+	return verdict(reason, reset_to_stack(ctx, flow.family, l3_off, l4_at));
 }
 
 char LICENSE[] SEC("license") = "GPL";
